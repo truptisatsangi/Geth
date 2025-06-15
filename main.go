@@ -4,15 +4,24 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
-// validators keeps track of open validators and balances
-var validators = make(map[string]uint)
-var chain [1000]Block
-var chainLength int
+// Node represents a validator node
+type Node struct {
+	Address     string
+	Stake       uint
+	StakePeriod uint
+}
 
+var chain []Block
+var Nodes = map[string]*Node{}
+var mu sync.Mutex
+
+// Block represents a block in the chain
 type Block struct {
 	Number    uint64
 	Hash      string
@@ -23,11 +32,21 @@ type Block struct {
 	Validator string
 }
 
+// Update stake of nodes
+func updateStake(id string, delta int) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	node := Nodes[id]
+	node.Stake += uint(delta)
+}
+
 // calculateBlockHash calculates the hash of a block.
 func calculateBlockHash(block Block) string {
 	record := strconv.FormatUint(block.Number, 10) +
 		strconv.FormatUint(block.Timestamp, 10) +
-		block.PrevHash + block.Data +
+		block.PrevHash +
+		block.Data +
 		strconv.FormatUint(block.Nonce, 10)
 
 	hash := sha256.Sum256([]byte(record))
@@ -40,83 +59,94 @@ func generateBlock(oldBlock Block, address string) (Block, error) {
 		Number:    oldBlock.Number + 1,
 		Timestamp: uint64(time.Now().Unix()),
 		PrevHash:  oldBlock.Hash,
+		Validator: address,
 		Data:      "0x",
 		Nonce:     0,
-		Validator: address,
 	}
 	newBlock.Hash = calculateBlockHash(newBlock)
-
 	return newBlock, nil
 }
 
-// stakeEth increases the validator's stake
-func stakeEth(amount uint, address string) {
-	validators[address] += amount
+func initiateNode(id string, address string, stake uint, stakePeriod uint) {
+	node := &Node{Address: address, Stake: stake, StakePeriod: stakePeriod}
+	Nodes[id] = node
 }
 
-// verifyBlock checks if a block is valid by comparing it with the last block in the chain
-func verifyBlock(block Block) bool {
-	if chainLength == 0 {
+// chooseValidator picks a validator based on weighted score
+func chooseValidator(validators map[string]*Node) string {
+	type scoreEntry struct {
+		Address string
+		Score   int
+	}
+	var scores []scoreEntry
+
+	for _, node := range validators {
+		score := int((node.Stake*50 + node.StakePeriod*50) / 100)
+		scores = append(scores, scoreEntry{Address: node.Address, Score: score})
+	}
+
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i].Score > scores[j].Score
+	})
+
+	if len(scores) > 0 {
+		return scores[0].Address
+	}
+	return ""
+}
+
+// generateAndValidateBlock creates a block and adds to chain if valid
+func generateAndValidateBlock(validator string) {
+	mu.Lock()
+	defer mu.Unlock()
+	lastBlock := chain[len(chain)-1]
+	newBlock, _ := generateBlock(lastBlock, validator)
+	chain = append(chain, newBlock)
+	fmt.Printf("Validator %s accepted block %d\n", validator, newBlock.Number)
+
+}
+
+// verifyBlock checks block validity
+func verifyBlock(block Block, node string) bool {
+	lastBlock := chain[len(chain)-2]
+	if block.Number != lastBlock.Number+1 || block.Hash != calculateBlockHash(block) {
+		fmt.Printf("Invalid block detected by %s\n", node)
 		return false
 	}
-	lastBlock := chain[chainLength-1]
-	if block.Number != lastBlock.Number+1 || block.PrevHash != lastBlock.Hash || block.Hash != calculateBlockHash(block) {
-		fmt.Println("Invalid block")
-		return false
-	}
+	fmt.Printf("Node %s has verified block number %d sucessfully\n", node, block.Number)
+
 	return true
 }
 
 func main() {
-	var stakingPeriod = make(map[string]uint)
-	var chosenValidator string
-
-	// Simulate validator deposits
-	validators["0"] = 32
-	validators["1"] = 39
-	validators["2"] = 96
-
-	// Simulate staking durations (e.g., time difference from deposit to now)
-	stakingPeriod["0"] = 110
-	stakingPeriod["1"] = 80
-	stakingPeriod["2"] = 10
-
-	// Create and add genesis block
 	genesisBlock := Block{
 		Number:    0,
 		Timestamp: uint64(time.Now().Unix()),
 		PrevHash:  "0x",
 		Data:      "Genesis Block",
 		Nonce:     0,
-		Validator: "GENESIS",
 	}
 	genesisBlock.Hash = calculateBlockHash(genesisBlock)
-	chain[0] = genesisBlock
-	chainLength++
+	chain = append(chain, genesisBlock)
 
-	// Choose validator with highest score
-	maxScore := 0
-	for address, deposit := range validators {
-		score := int((deposit*50 + stakingPeriod[address]*50) / 100)
-		if score > maxScore {
-			maxScore = score
-			chosenValidator = address
+	// Initiate Validators
+	initiateNode("1", "0x0000000000000000000000000000000000000001", 32, 110)
+	initiateNode("2", "0x0000000000000000000000000000000000000002", 39, 80)
+	initiateNode("3", "0x0000000000000000000000000000000000000003", 96, 10)
+
+	// Choose Validator
+	validator := chooseValidator(Nodes)
+	generateAndValidateBlock(validator)
+
+	// Verify block by other nodes
+	for _, node := range Nodes {
+		if node.Address != validator {
+			isValid := verifyBlock(chain[len(chain)-1], node.Address)
+			if !isValid {
+				panic(fmt.Sprintf("Node %s detected an invalid block. Halting!", node.Address))
+
+			}
 		}
 	}
-	fmt.Println("Chosen Validator:", chosenValidator)
-
-	// Generate and verify a new block
-	newBlock, err := generateBlock(chain[chainLength-1], chosenValidator)
-	if err != nil {
-		fmt.Println("Error generating block:", err)
-		return
-	}
-
-	if verifyBlock(newBlock) {
-		chain[chainLength] = newBlock
-		chainLength++
-		fmt.Println("Block added to the chain by", newBlock.Validator)
-	} else {
-		fmt.Println("Failed to add block: Verification failed")
-	}
+	fmt.Print("A block is successfully added")
 }
